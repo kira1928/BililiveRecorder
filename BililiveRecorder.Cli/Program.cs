@@ -39,6 +39,7 @@ namespace BililiveRecorder.Cli
     {
         private static int Main(string[] args)
         {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BREC_SKIP_DISABLE_QUICK_EDIT")))
             {
@@ -99,10 +100,21 @@ namespace BililiveRecorder.Cli
                     cmd_portable.AddAlias("p");
                     cmd_portable.Handler = CommandHandler.Create<PortableModeArguments>(RunPortableModeAsync);
 
+                    var cmd_downloader = new Command("downloader", "Run BililiveRecorder as downloader")
+                    {
+                        new Option<string>(new []{ "--cookie", "-c" }, "Cookie string for api requests"),
+
+                        new Argument<string>("url"),
+                        new Argument<string>("output-path"),
+                    };
+                    cmd_downloader.AddAlias("d");
+                    cmd_downloader.Handler = CommandHandler.Create<DownloaderArguments>(RunDownloaderModeAsync);
+
                     root = new RootCommand("A Stream Recorder For Bilibili Live")
                     {
                         cmd_run,
                         cmd_portable,
+                        cmd_downloader,
                         new ConfigureCommand(),
                         new ToolCommand(),
                     };
@@ -193,6 +205,21 @@ namespace BililiveRecorder.Cli
             var serviceProvider = BuildServiceProvider(config, logger);
 
             return await RunRecorderAsync(serviceProvider, args);
+        }
+
+        private static async Task<int> RunDownloaderModeAsync(DownloaderArguments args)
+        {
+            using var logger = BuildLogger(args.LogLevel, args.LogFileLevel, enableWebLog: args.HttpBind is not null);
+            Log.Logger = logger;
+
+            var serviceProvider = BuildServiceProvider(logger);
+
+            var downloaderFactory = serviceProvider.GetRequiredService<IDownloaderFactory>();
+            DownloaderConfig config = new DownloaderConfig(args.Url, args.OutputPath);
+            var downloader = downloaderFactory.CreateDownloader(config);
+            await downloader.StartRecord(serviceProvider);
+
+            return 0;
         }
 
         private static async Task<int> RunRecorderAsync(IServiceProvider serviceProvider, SharedArguments sharedArguments)
@@ -448,6 +475,12 @@ namespace BililiveRecorder.Cli
             .AddRecorder()
             .BuildServiceProvider();
 
+        private static IServiceProvider BuildServiceProvider(ILogger logger) => new ServiceCollection()
+            .AddSingleton(logger)
+            .AddFlv()
+            .AddRecorder()
+            .BuildServiceProvider();
+
         private static Logger BuildLogger(LogEventLevel logLevel, LogEventLevel logFileLevel, bool enableWebLog = false)
         {
             var logFilePath = Environment.GetEnvironmentVariable("BILILIVERECORDER_LOG_FILE_PATH");
@@ -577,6 +610,13 @@ namespace BililiveRecorder.Cli
                 RawData = 1 << 4,
                 All = Danmaku | SuperChat | Guard | Gift | RawData
             }
+        }
+
+        public sealed class DownloaderArguments : SharedArguments
+        {
+            public string Url { get; set; } = string.Empty;
+
+            public string OutputPath { get; set; } = string.Empty;
         }
 
         private static class ConsoleModeHelper
