@@ -103,6 +103,7 @@ namespace BililiveRecorder.Cli
                     var cmd_downloader = new Command("downloader", "Run BililiveRecorder as downloader")
                     {
                         new Option<string>(new []{ "--cookie", "-c" }, "Cookie string for api requests"),
+                        new Option<IEnumerable<string>>(new string[]{ "--download-header", "-h" }, "Http header for downloader"),
 
                         new Argument<string>("url"),
                         new Argument<string>("output-path"),
@@ -215,7 +216,7 @@ namespace BililiveRecorder.Cli
             var serviceProvider = BuildServiceProvider(logger);
 
             var downloaderFactory = serviceProvider.GetRequiredService<IDownloaderFactory>();
-            DownloaderConfig config = new DownloaderConfig(args.Url, args.OutputPath);
+            DownloaderConfig config = new DownloaderConfig(args.Url, args.OutputPath, args.Cookie, args.DownloadHeaders);
             var downloader = downloaderFactory.CreateDownloader(config);
             await downloader.StartRecord(serviceProvider);
 
@@ -614,6 +615,10 @@ namespace BililiveRecorder.Cli
 
         public sealed class DownloaderArguments : SharedArguments
         {
+            public string? Cookie { get; set; }
+
+            public IEnumerable<string>? DownloadHeaders { get; set; }
+
             public string Url { get; set; } = string.Empty;
 
             public string OutputPath { get; set; } = string.Empty;

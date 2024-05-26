@@ -167,14 +167,36 @@ namespace BililiveRecorder.Core.Recording
         {
             var httpClient = new HttpClient(new HttpClientHandler
             {
-                AllowAutoRedirect = false,
+                UseCookies = false,
+                UseDefaultCredentials = false,
+                //AllowAutoRedirect = false,
                 //UseProxy = this.room.RoomConfig.NetworkTransportUseSystemProxy,
-            });
-            //var headers = httpClient.DefaultRequestHeaders;
-            //headers.Add("Accept", HttpHeaderAccept);
-            //headers.Add("Origin", HttpHeaderOrigin);
-            //headers.Add("Referer", HttpHeaderReferer);
-            //headers.Add("User-Agent", HttpHeaderUserAgent);
+            })
+            {
+                Timeout = TimeSpan.FromMilliseconds(10000)
+            };
+            var headers = httpClient.DefaultRequestHeaders;
+            var cookie_string = this.downloader.DownloaderConfig.Cookie;
+            if (!string.IsNullOrWhiteSpace(cookie_string))
+            {
+                headers.Add("Cookie", cookie_string);
+            }
+            if (this.downloader.DownloaderConfig.DownloadHeaders is not null)
+            {
+                foreach (var header in this.downloader.DownloaderConfig.DownloadHeaders)
+                {
+                    var headerParts = header.Split(new[] { ':' }, 2); // 指定最大分割数量为2
+                    if (headerParts.Length == 2)
+                    {
+                        headers.Add(headerParts[0], headerParts[1]);
+                    }
+                    else
+                    {
+                        this.logger.Warning("下载请求头格式错误：{Header}", header);
+                    }
+                }
+            }
+
             return httpClient;
         }
 
