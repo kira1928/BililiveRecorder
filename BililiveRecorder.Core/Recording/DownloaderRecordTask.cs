@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
 using System.Linq;
@@ -8,6 +9,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Timers;
 using BililiveRecorder.Core.Event;
 using BililiveRecorder.Core.ProcessingRules;
 using BililiveRecorder.Flv;
@@ -16,6 +18,7 @@ using BililiveRecorder.Flv.Pipeline;
 using BililiveRecorder.Flv.Pipeline.Actions;
 using Microsoft.Extensions.DependencyInjection;
 using Serilog;
+using Timer = System.Timers.Timer;
 
 namespace BililiveRecorder.Core.Recording
 {
@@ -31,10 +34,28 @@ namespace BililiveRecorder.Core.Recording
         private readonly ProcessingDelegate pipeline;
         private readonly IFlvWriterTargetProvider targetProvider;
 
+        private readonly StatsRule statsRule;
         private readonly SplitRule splitFileRule;
 
         private readonly FlvProcessingContext context = new FlvProcessingContext();
         private readonly IDictionary<object, object?> session = new Dictionary<object, object?>();
+
+        private readonly CancellationTokenSource cts = new CancellationTokenSource();
+        private readonly CancellationToken ct;
+
+        private readonly Timer timer = new Timer(1000 * 2); // 每2秒更新一次统计
+        private readonly object ioStatsLock = new();
+        private int ioNetworkDownloadedBytes;
+        
+        private readonly Stopwatch ioDiskStopwatch = new();
+        private readonly object ioDiskStatsLock = new();
+        private TimeSpan ioDiskWriteDuration;
+        private int ioDiskWrittenBytes;
+
+        private DateTimeOffset ioStatsLastTrigger;
+        private TimeSpan durationSinceNoDataReceived;
+        private bool timeoutTriggered = false;
+        private string? streamHost;
 
         private ITagGroupReader? reader;
 
@@ -70,14 +91,19 @@ namespace BililiveRecorder.Core.Recording
             if (builder is null)
                 throw new ArgumentNullException(nameof(builder));
 
+            this.statsRule = new StatsRule();
             this.splitFileRule = new SplitRule();
 
+            this.ct = this.cts.Token;
+
+            this.statsRule.StatsUpdated += this.StatsRule_StatsUpdated;
 
             this.pipeline = builder
                 .ConfigureServices(services => services.AddSingleton(new ProcessingPipelineSettings
                 {
                     SplitOnScriptTag = true,
                 }))
+                .AddRule(this.statsRule)
                 .AddRule(this.splitFileRule)
                 .AddDefaultRules()
                 .AddRemoveFillerDataRule()
@@ -85,42 +111,44 @@ namespace BililiveRecorder.Core.Recording
 
             this.targetProvider = new WriterTargetProvider(this, downloader.DownloaderConfig.OutputPath);
 
+            this.timer.Elapsed += this.Timer_Elapsed_TriggerIOStats;
         }
 
         void IRecordTask.SplitOutput() => throw new NotImplementedException();
+        
+        void IRecordTask.RequestStop() => this.cts.Cancel();
+        
         public async Task StartAsync()
         {
             var stream = await this.GetStreamAsync(fullUrl: this.downloader.DownloaderConfig.Url, timeout: 5 * 1000).ConfigureAwait(false);
 
-            //this.ioStatsLastTrigger = DateTimeOffset.UtcNow;
-            //this.durationSinceNoDataReceived = TimeSpan.Zero;
+            this.ioStatsLastTrigger = DateTimeOffset.UtcNow;
+            this.durationSinceNoDataReceived = TimeSpan.Zero;
 
-//            this.ct.Register(state => Task.Run(async () =>
-//            {
-//                try
-//                {
-//                    if (state is not WeakReference<Stream> weakRef)
-//                        return;
+            this.ct.Register(state => _ = Task.Run(async () =>
+            {
+                try
+                {
+                    if (state is not WeakReference<Stream> weakRef)
+                        return;
 
-//                    await Task.Delay(1000);
+                    await Task.Delay(1000);
 
-//                    if (weakRef.TryGetTarget(out var weakStream))
-//                    {
-//#if NET6_0_OR_GREATER
-//                        await weakStream.DisposeAsync();
-//#else
-//                        weakStream.Dispose();
-//#endif
-//                    }
-//                }
-//                catch (Exception)
-//                { }
-//            }), state: new WeakReference<Stream>(stream), useSynchronizationContext: false);
+                    if (weakRef.TryGetTarget(out var weakStream))
+                    {
+#if NET6_0_OR_GREATER
+                        await weakStream.DisposeAsync();
+#else
+                        weakStream.Dispose();
+#endif
+                    }
+                }
+                catch (Exception)
+                { }
+            }), state: new WeakReference<Stream>(stream), useSynchronizationContext: false);
 
             await this.StartRecordingLoop(stream);
         }
-
-        void IRecordTask.RequestStop() => throw new NotImplementedException();
 
         protected async Task<Stream> GetStreamAsync(string fullUrl, int timeout)
         {
@@ -145,6 +173,7 @@ namespace BililiveRecorder.Core.Recording
                     case HttpStatusCode.OK:
                         {
                             this.logger.Information("开始接收直播流");
+                            this.streamHost = originalUri.Host;
                             //this.streamHostFull = streamHostInfoBuilder.ToString();
                             var stream = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
                             return stream;
@@ -165,13 +194,19 @@ namespace BililiveRecorder.Core.Recording
         }
         private HttpClient CreateHttpClient()
         {
-            var httpClient = new HttpClient(new HttpClientHandler
+            var handler = new HttpClientHandler
             {
                 UseCookies = false,
                 UseDefaultCredentials = false,
-                //AllowAutoRedirect = false,
-                //UseProxy = this.room.RoomConfig.NetworkTransportUseSystemProxy,
-            })
+                UseProxy = this.downloader.DownloaderConfig.UseSystemProxy || !string.IsNullOrWhiteSpace(this.downloader.DownloaderConfig.Proxy),
+            };
+
+            if (!string.IsNullOrWhiteSpace(this.downloader.DownloaderConfig.Proxy))
+            {
+                handler.Proxy = new WebProxy(this.downloader.DownloaderConfig.Proxy);
+            }
+
+            var httpClient = new HttpClient(handler)
             {
                 Timeout = TimeSpan.FromMilliseconds(10000)
             };
@@ -231,22 +266,21 @@ namespace BililiveRecorder.Core.Recording
         private async Task FillPipeAsync(Stream stream, PipeWriter writer)
         {
             const int minimumBufferSize = 1024;
-            //this.timer.Start();
+            this.timer.Start();
 
             Exception? exception = null;
             try
             {
-                //while (!this.ct.IsCancellationRequested)
-                while (true)
+                while (!this.ct.IsCancellationRequested)
                 {
                     var memory = writer.GetMemory(minimumBufferSize);
                     try
                     {
-                        var bytesRead = await stream.ReadAsync(memory).ConfigureAwait(false);
+                        var bytesRead = await stream.ReadAsync(memory, this.ct).ConfigureAwait(false);
                         if (bytesRead == 0)
                             break;
                         writer.Advance(bytesRead);
-                        //_ = Interlocked.Add(ref this.ioNetworkDownloadedBytes, bytesRead);
+                        _ = Interlocked.Add(ref this.ioNetworkDownloadedBytes, bytesRead);
                     }
                     catch (Exception ex)
                     {
@@ -254,14 +288,14 @@ namespace BililiveRecorder.Core.Recording
                         break;
                     }
 
-                    var result = await writer.FlushAsync().ConfigureAwait(false);
+                    var result = await writer.FlushAsync(this.ct).ConfigureAwait(false);
                     if (result.IsCompleted)
                         break;
                 }
             }
             finally
             {
-                //this.timer.Stop();
+                this.timer.Stop();
 #if NET6_0_OR_GREATER
                 await stream.DisposeAsync().ConfigureAwait(false);
 #else
@@ -278,10 +312,9 @@ namespace BililiveRecorder.Core.Recording
                 if (this.reader is null) return;
                 if (this.writer is null) return;
 
-                //while (!this.ct.IsCancellationRequested)
-                while (true)
+                while (!this.ct.IsCancellationRequested)
                 {
-                    var group = await this.reader.ReadGroupAsync(CancellationToken.None).ConfigureAwait(false);
+                    var group = await this.reader.ReadGroupAsync(this.ct).ConfigureAwait(false);
 
                     if (group is null)
                         break;
@@ -293,16 +326,16 @@ namespace BililiveRecorder.Core.Recording
                     if (this.context.Comments.Count > 0)
                         this.logger.Debug("修复逻辑输出 {@Comments}", this.context.Comments);
 
-                    //this.ioDiskStopwatch.Restart();
+                    this.ioDiskStopwatch.Restart();
                     var bytesWritten = await this.writer.WriteAsync(this.context).ConfigureAwait(false);
-                    //this.ioDiskStopwatch.Stop();
+                    this.ioDiskStopwatch.Stop();
 
-                    //lock (this.ioDiskStatsLock)
-                    //{
-                    //    this.ioDiskWriteDuration += this.ioDiskStopwatch.Elapsed;
-                    //    this.ioDiskWrittenBytes += bytesWritten;
-                    //}
-                    //this.ioDiskStopwatch.Reset();
+                    lock (this.ioDiskStatsLock)
+                    {
+                        this.ioDiskWriteDuration += this.ioDiskStopwatch.Elapsed;
+                        this.ioDiskWrittenBytes += bytesWritten;
+                    }
+                    this.ioDiskStopwatch.Reset();
 
                     if (this.context.Actions.FirstOrDefault(x => x is PipelineDisconnectAction) is PipelineDisconnectAction disconnectAction)
                     {
@@ -343,10 +376,91 @@ namespace BililiveRecorder.Core.Recording
             }
         }
 
+        private void StatsRule_StatsUpdated(object? sender, RecordingStatsEventArgs e)
+        {
+            var maxDuration = this.downloader.DownloaderConfig.MaxDuration;
+            var maxSize = this.downloader.DownloaderConfig.MaxSize;
+
+            // 按时长分割
+            if (maxDuration.HasValue && maxDuration.Value > 0)
+            {
+                if (e.FileMaxTimestamp > maxDuration.Value * 60u * 1000u)
+                    this.splitFileRule.SetSplitBeforeFlag();
+            }
+            
+            // 按大小分割
+            if (maxSize.HasValue && maxSize.Value > 0)
+            {
+                if ((e.CurrentFileSize + (e.OutputVideoBytes * 1.1) + e.OutputAudioBytes) / (1024d * 1024d) > maxSize.Value)
+                    this.splitFileRule.SetSplitBeforeFlag();
+            }
+
+            this.OnRecordingStats(e);
+        }
+
+        private void Timer_Elapsed_TriggerIOStats(object? sender, System.Timers.ElapsedEventArgs e)
+        {
+            int networkDownloadBytes, diskWriteBytes;
+            TimeSpan durationDiff, diskWriteDuration;
+            DateTimeOffset startTime, endTime;
+
+            lock (this.ioStatsLock) // 锁 timer elapsed 事件本身防止并行运行
+            {
+                // networks
+                networkDownloadBytes = Interlocked.Exchange(ref this.ioNetworkDownloadedBytes, 0);
+                endTime = DateTimeOffset.UtcNow;
+                startTime = this.ioStatsLastTrigger;
+                this.ioStatsLastTrigger = endTime;
+                durationDiff = endTime - startTime;
+
+                this.durationSinceNoDataReceived = networkDownloadBytes > 0 ? TimeSpan.Zero : this.durationSinceNoDataReceived + durationDiff;
+
+                // disks
+                lock (this.ioDiskStatsLock)
+                {
+                    diskWriteDuration = this.ioDiskWriteDuration;
+                    diskWriteBytes = this.ioDiskWrittenBytes;
+                    this.ioDiskWriteDuration = TimeSpan.Zero;
+                    this.ioDiskWrittenBytes = 0;
+                }
+            }
+
+            var netMbps = networkDownloadBytes * (8d / 1024d / 1024d) / durationDiff.TotalSeconds;
+            var diskMBps = diskWriteBytes / (1024d * 1024d) / (diskWriteDuration.TotalSeconds > 0 ? diskWriteDuration.TotalSeconds : 1);
+
+            this.OnIOStats(new IOStatsEventArgs
+            {
+                StreamHost = this.streamHost,
+                NetworkBytesDownloaded = networkDownloadBytes,
+                Duration = durationDiff,
+                StartTime = startTime,
+                EndTime = endTime,
+                NetworkMbps = netMbps,
+                DiskBytesWritten = diskWriteBytes,
+                DiskWriteDuration = diskWriteDuration,
+                DiskMBps = diskMBps,
+            });
+
+            if ((!this.timeoutTriggered) && (this.durationSinceNoDataReceived.TotalMilliseconds > this.downloader.DownloaderConfig.TimingWatchdogTimeout))
+            {
+                this.timeoutTriggered = true;
+                this.logger.Warning("检测到录制卡住，可能是网络或硬盘原因，将会主动断开连接");
+                this.cts.Cancel();
+            }
+        }
+
+        protected void OnIOStats(IOStatsEventArgs e) => IOStats?.Invoke(this, e);
+        protected void OnRecordingStats(RecordingStatsEventArgs e) => RecordingStats?.Invoke(this, e);
+        protected void OnRecordFileOpening(RecordFileOpeningEventArgs e) => RecordFileOpening?.Invoke(this, e);
+        protected void OnRecordFileClosed(RecordFileClosedEventArgs e) => RecordFileClosed?.Invoke(this, e);
+        protected void OnRecordSessionEnded(EventArgs e) => RecordSessionEnded?.Invoke(this, e);
+
         internal class WriterTargetProvider : IFlvWriterTargetProvider
         {
             private readonly DownloaderRecordTask task;
             private readonly string dstPath;
+            private int partIndex = 0;
+            private string last_path = string.Empty;
 
             public WriterTargetProvider(DownloaderRecordTask task, string dstPath)
             {
@@ -356,17 +470,29 @@ namespace BililiveRecorder.Core.Recording
 
             public (Stream stream, object? state) CreateOutputStream()
             {
+                var directory = Path.GetDirectoryName(this.dstPath)!;
+                var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(this.dstPath);
+                var extension = Path.GetExtension(this.dstPath);
+                
+                var fullPath = Path.Combine(directory, $"{fileNameWithoutExtension}_PART{this.partIndex:D3}{extension}");
+                this.partIndex++;
+
                 try
-                { _ = Directory.CreateDirectory(Path.GetDirectoryName(this.dstPath)!); }
+                { _ = Directory.CreateDirectory(directory); }
                 catch (Exception) { }
 
-                var stream = new FileStream(this.dstPath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+                this.last_path = fullPath;
+                this.task.logger.Information("创建录制文件 '{Path}'", fullPath);
+
+                var stream = new FileStream(fullPath, FileMode.Create, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
                 return (stream, null);
             }
 
             public Stream CreateAccompanyingTextLogStream()
             {
-                var path = Path.ChangeExtension(this.dstPath, "txt");
+                var path = string.IsNullOrWhiteSpace(this.last_path)
+                    ? Path.ChangeExtension(this.dstPath, "txt")
+                    : Path.ChangeExtension(this.last_path, "txt");
 
                 try
                 { _ = Directory.CreateDirectory(Path.GetDirectoryName(path)!); }

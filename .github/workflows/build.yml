@@ -1,10 +1,8 @@
 name: Build and Test
 
 on:
-  push:
-    branches:
-      - "**"
   pull_request:
+  workflow_dispatch:
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -22,12 +20,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - uses: actions/setup-dotnet@v3
+      - uses: actions/setup-dotnet@v4
 
       # - name: Make sure webui can be built
       #   if: "${{ matrix.os == 'windows-latest' }}"
@@ -79,17 +77,27 @@ jobs:
     # needs: test
     strategy:
       matrix:
-        # rid: [any, linux-arm, linux-arm64, linux-x64, osx-x64, osx-arm64, win-x64]
-        rid: [any]
+        rid:
+          [
+            any,
+            linux-arm,
+            linux-arm64,
+            linux-musl-arm64,
+            linux-x64,
+            linux-musl-x64,
+            osx-x64,
+            osx-arm64,
+            win-x64,
+          ]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
-      - uses: actions/setup-dotnet@v3
+      - uses: actions/setup-dotnet@v4
 
       # - name: Build WebUI
       #   run: ./webui/build.sh
@@ -101,23 +109,23 @@ jobs:
         if: ${{ matrix.rid == 'any' }}
         run: dotnet publish -c Release BililiveRecorder.Cli/BililiveRecorder.Cli.csproj
 
-      # - name: Build CLI - Debug
-      #   if: ${{ matrix.rid != 'any' }}
-      #   run: dotnet publish -c Debug -r ${{ matrix.rid }} BililiveRecorder.Cli/BililiveRecorder.Cli.csproj
-      # - name: Build CLI - Release
-      #   if: ${{ matrix.rid != 'any' }}
-      #   run: dotnet publish -c Release -r ${{ matrix.rid }} BililiveRecorder.Cli/BililiveRecorder.Cli.csproj
+      - name: Build CLI - Debug
+        if: ${{ matrix.rid != 'any' }}
+        run: dotnet publish -c Debug -r ${{ matrix.rid }} BililiveRecorder.Cli/BililiveRecorder.Cli.csproj --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
+      - name: Build CLI - Release
+        if: ${{ matrix.rid != 'any' }}
+        run: dotnet publish -c Release -r ${{ matrix.rid }} BililiveRecorder.Cli/BililiveRecorder.Cli.csproj --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 
-      # - name: Upload Artifacts - Debug
-      #   uses: actions/upload-artifact@v3
-      #   with:
-      #     name: CLI-${{ matrix.rid }}-Debug
-      #     path: BililiveRecorder.Cli/publish/${{ matrix.rid }}/Debug
-      # - name: Upload Artifacts - Release
-      #   uses: actions/upload-artifact@v3
-      #   with:
-      #     name: CLI-${{ matrix.rid }}-Release
-      #     path: BililiveRecorder.Cli/publish/${{ matrix.rid }}/Release
+      - name: Upload Artifacts - Debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLI-${{ matrix.rid }}-Debug
+          path: BililiveRecorder.Cli/publish/${{ matrix.rid }}/Debug
+      - name: Upload Artifacts - Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLI-${{ matrix.rid }}-Release
+          path: BililiveRecorder.Cli/publish/${{ matrix.rid }}/Release
 
   # build_docker:
   #   # Tests can be run parallelly for debug builds to save time

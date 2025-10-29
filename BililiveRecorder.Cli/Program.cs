@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.CommandLine;
+using System.CommandLine.Builder;
 using System.CommandLine.NamingConventionBinder;
+using System.CommandLine.Parsing;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -14,6 +17,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using BililiveRecorder.Cli.Configure;
 using BililiveRecorder.Core;
+using BililiveRecorder.Core.Api;
 using BililiveRecorder.Core.Config;
 using BililiveRecorder.Core.Config.V3;
 using BililiveRecorder.DependencyInjection;
@@ -45,6 +49,10 @@ namespace BililiveRecorder.Cli
             {
                 ConsoleModeHelper.SetQuickEditMode(false);
             }
+
+            DistributedContextPropagator.Current = DistributedContextPropagator.CreateNoOutputPropagator();
+            AppContext.SetSwitch("System.Net.Http.EnableActivityPropagation", false);
+
             RootCommand root;
 
             using (var entrypointLogger = BuildLogger(LogEventLevel.Fatal, LogEventLevel.Verbose))
@@ -102,8 +110,16 @@ namespace BililiveRecorder.Cli
 
                     var cmd_downloader = new Command("downloader", "Run BililiveRecorder as downloader")
                     {
+                        new Option<LogEventLevel>(new []{ "--loglevel", "--log", "-l" }, () => LogEventLevel.Information, "Minimal log level output to console (Verbose|Debug|Information|Warning|Error|Fatal)"),
                         new Option<string>(new []{ "--cookie", "-c" }, "Cookie string for api requests"),
-                        new Option<IEnumerable<string>>(new string[]{ "--download-header", "-h" }, "Http header for downloader"),
+                        new Option<IEnumerable<string>>(new string[]{ "--download-headers", "-h" }, "Http header for downloader"),
+                        new Option<bool>(new []{ "--progress", "-p" }, () => false, "Show recording progress"),
+                        new Option<int?>(new []{ "--max-size", "-m" }, "Maximum file size in MB"),
+                        new Option<int?>(new []{ "--max-duration", "-d" }, "Maximum duration in minutes"),
+                        new Option<bool>(new []{ "--disable-log-file" }, () => false, "Disable log file output"),
+                        new Option<bool>(new []{ "--use-system-proxy" }, () => false, "Use system proxy settings"),
+                        new Option<string>(new []{ "--proxy" }, "Manual proxy address (e.g., http://127.0.0.1:7890)"),
+                        new Option<uint>(new []{ "--timing-watchdog-timeout", "-t" }, () => 10000, "Watchdog timeout in milliseconds (default: 10000)"),
 
                         new Argument<string>("url"),
                         new Argument<string>("output-path"),
@@ -127,7 +143,41 @@ namespace BililiveRecorder.Cli
                 }
             }
 
-            return root.Invoke(args);
+            var builder = new CommandLineBuilder(root);
+
+            builder.AddMiddleware(async (context, next) =>
+            {
+                var isToolCommand = false;
+                var tct = typeof(ToolCommand);
+                var cr = context.ParseResult.CommandResult;
+                while (cr is not null)
+                {
+                    if (cr.Command.GetType() == tct)
+                    {
+                        isToolCommand = true;
+                        break;
+                    }
+                    cr = cr.Parent as CommandResult;
+                }
+                cr = null;
+
+                if (isToolCommand)
+                {
+                    // hack to enable logging for tool commands
+                    using var logger = BuildLogger(LogEventLevel.Fatal, LogEventLevel.Verbose);
+                    Log.Logger = logger;
+                    await next(context);
+                    return;
+                }
+                else
+                {
+                    await next(context);
+                }
+            });
+
+            builder.UseDefaults();
+            var parser = builder.Build();
+            return parser.Invoke(args);
         }
 
         private static async Task<int> RunConfigModeAsync(RunModeArguments args)
@@ -143,8 +193,17 @@ namespace BililiveRecorder.Cli
 
             if (args.ConfigOverride is not null)
             {
-                logger.Information("Using config from {ConfigOverride}", args.ConfigOverride);
-                config = ConfigParser.LoadFromFile(args.ConfigOverride);
+                if (Directory.Exists(args.ConfigOverride))
+                {
+                    var overrideFile = Path.Combine(args.ConfigOverride, "config.json");
+                    logger.Information("Using config from {ConfigOverride}", overrideFile);
+                    config = ConfigParser.LoadFromFile(overrideFile);
+                }
+                else
+                {
+                    logger.Information("Using config from {ConfigOverride}", args.ConfigOverride);
+                    config = ConfigParser.LoadFromFile(args.ConfigOverride);
+                }
             }
             else
             {
@@ -210,14 +269,25 @@ namespace BililiveRecorder.Cli
 
         private static async Task<int> RunDownloaderModeAsync(DownloaderArguments args)
         {
-            using var logger = BuildLogger(args.LogLevel, args.LogFileLevel, enableWebLog: args.HttpBind is not null);
+            using var logger = BuildLogger(args.LogLevel, LogEventLevel.Information, enableWebLog: false, enableLogFile: !args.DisableLogFile);
             Log.Logger = logger;
 
             var serviceProvider = BuildServiceProvider(logger);
 
             var downloaderFactory = serviceProvider.GetRequiredService<IDownloaderFactory>();
-            DownloaderConfig config = new DownloaderConfig(args.Url, args.OutputPath, args.Cookie, args.DownloadHeaders);
+            DownloaderConfig config = new DownloaderConfig(args.Url, args.OutputPath, args.Cookie, args.DownloadHeaders, args.MaxSize, args.MaxDuration, args.UseSystemProxy, args.Proxy, args.TimingWatchdogTimeout);
             var downloader = downloaderFactory.CreateDownloader(config);
+
+            if (args.Progress)
+            {
+                downloader.RecordingStats += (sender, e) =>
+                {
+                    var sessionTime = TimeSpan.FromMilliseconds(e.SessionMaxTimestamp);
+                    var fileTime = TimeSpan.FromMilliseconds(e.FileMaxTimestamp);
+                    var fileSizeMB = e.CurrentFileSize / 1024.0 / 1024.0;
+                    Console.Write($"下载进度: {fileSizeMB:F2} MB | 录制时长: {sessionTime:hh\\:mm\\:ss} | 当前文件: {fileTime:hh\\:mm\\:ss}    ");
+                };
+            }
             await downloader.StartRecord(serviceProvider);
 
             return 0;
@@ -259,7 +329,8 @@ namespace BililiveRecorder.Cli
                             services.AddSingleton(new BasicAuthCredential(sharedArguments.HttpBasicUser ?? string.Empty, sharedArguments.HttpBasicPass ?? string.Empty));
                         }
 
-                        if (sharedArguments.HttpOpenAccess || Environment.GetEnvironmentVariable("BREC_HTTP_OPEN_ACCESS") is not null){
+                        if (sharedArguments.HttpOpenAccess || Environment.GetEnvironmentVariable("BREC_HTTP_OPEN_ACCESS") is not null)
+                        {
                             services.AddSingleton(new DisableOpenAccessWarningConfig());
                         }
                     })
@@ -289,7 +360,7 @@ namespace BililiveRecorder.Cli
                                 {
                                     listenOptions.UseHttps(LoadCertificate(sharedArguments, logger) ?? GenerateSelfSignedCertificate(logger), https =>
                                     {
-                                        https.SslProtocols = SslProtocols.Tls11 | SslProtocols.Tls12 | SslProtocols.Tls13;
+                                        https.SslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13;
                                     });
                                 }
                             }
@@ -482,7 +553,7 @@ namespace BililiveRecorder.Cli
             .AddRecorder()
             .BuildServiceProvider();
 
-        private static Logger BuildLogger(LogEventLevel logLevel, LogEventLevel logFileLevel, bool enableWebLog = false)
+        private static Logger BuildLogger(LogEventLevel logLevel, LogEventLevel logFileLevel, bool enableWebLog = false, bool enableLogFile = true)
         {
             var logFilePath = Environment.GetEnvironmentVariable("BILILIVERECORDER_LOG_FILE_PATH");
             if (string.IsNullOrWhiteSpace(logFilePath))
@@ -499,10 +570,10 @@ namespace BililiveRecorder.Cli
                 .Enrich.WithProcessId()
                 .Enrich.WithThreadId()
                 .Enrich.WithThreadName()
-                .Enrich.FromLogContext()
                 .Enrich.WithExceptionDetails()
                 .Destructure.AsScalar<IPAddress>()
                 .Destructure.AsScalar<ProcessingComment>()
+                .Destructure.AsScalar<StreamCodecQn>()
                 .Destructure.ByTransforming<Flv.Xml.XmlFlvFile.XmlFlvFileMeta>(x => new
                 {
                     x.Version,
@@ -510,21 +581,26 @@ namespace BililiveRecorder.Cli
                     x.FileSize,
                     x.FileCreationTime,
                     x.FileModificationTime,
-                })
-                .WriteTo.Logger(sl =>
-                {
-                    sl
-                    .Filter.ByExcluding(matchMicrosoft)
-                    .WriteTo.File(new CompactJsonFormatter(), logFilePath, restrictedToMinimumLevel: logFileLevel, shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
-                    ;
-                })
-                .WriteTo.Logger(sl =>
-                {
-                    sl
-                    .Filter.ByIncludingOnly(matchMicrosoft)
-                    .WriteTo.File(new CompactJsonFormatter(), logFilePathMicrosoft, restrictedToMinimumLevel: logFileLevel, shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
-                    ;
                 });
+
+            if (enableLogFile)
+            {
+                builder
+                    .WriteTo.Logger(sl =>
+                    {
+                        sl
+                        .Filter.ByExcluding(matchMicrosoft)
+                        .WriteTo.File(new CompactJsonFormatter(), logFilePath, restrictedToMinimumLevel: logFileLevel, shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
+                        ;
+                    })
+                    .WriteTo.Logger(sl =>
+                    {
+                        sl
+                        .Filter.ByIncludingOnly(matchMicrosoft)
+                        .WriteTo.File(new CompactJsonFormatter(), logFilePathMicrosoft, restrictedToMinimumLevel: logFileLevel, shared: true, rollingInterval: RollingInterval.Day, rollOnFileSizeLimit: true)
+                        ;
+                    });
+            }
 
             if (enableWebLog)
             {
@@ -619,9 +695,23 @@ namespace BililiveRecorder.Cli
 
             public IEnumerable<string>? DownloadHeaders { get; set; }
 
+            public int? MaxSize { get; set; }
+
+            public int? MaxDuration { get; set; }
+
+            public bool DisableLogFile { get; set; }
+
             public string Url { get; set; } = string.Empty;
 
             public string OutputPath { get; set; } = string.Empty;
+            
+            public bool Progress { get; set; }
+
+            public bool UseSystemProxy { get; set; } = false;
+
+            public string? Proxy { get; set; }
+
+            public uint TimingWatchdogTimeout { get; set; } = 10000;
         }
 
         private static class ConsoleModeHelper
