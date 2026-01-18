@@ -108,6 +108,7 @@ namespace BililiveRecorder.Core.Recording
                 .AddRule(this.splitFileRule)
                 .AddDefaultRules()
                 .AddRemoveFillerDataRule()
+                .AddAudioOnlyRule(downloader.DownloaderConfig.AudioOnly)
                 .Build();
 
             this.targetProvider = new WriterTargetProvider(this, downloader.DownloaderConfig.OutputPath);

@@ -41,5 +41,17 @@ namespace BililiveRecorder.Flv.Pipeline
 
         public static IProcessingPipelineBuilder AddRemoveFillerDataRule(this IProcessingPipelineBuilder builder) =>
             builder.AddRule<RemoveFillerDataRule>();
+
+        /// <summary>
+        /// 添加只录音频规则（根据条件）
+        /// </summary>
+        /// <param name="builder">Pipeline 构建器</param>
+        /// <param name="audioOnly">是否启用只录音频模式</param>
+        public static IProcessingPipelineBuilder AddAudioOnlyRule(this IProcessingPipelineBuilder builder, bool audioOnly)
+        {
+            if (audioOnly)
+                return builder.AddRule<AudioOnlyRule>();
+            return builder;
+        }
     }
 }
